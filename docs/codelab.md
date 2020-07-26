@@ -94,7 +94,7 @@ searcher.IndexDocument(docId, types.DocumentIndexData{
 })
 ```
 
-文档的docId必须唯一，对微博来说可以直接用微博的ID。悟空引擎允许你加入三种索引数据：
+文档的docId必须大于0且唯一，对微博来说可以直接用微博的ID。悟空引擎允许你加入三种索引数据：
 
 1. 文档的正文（content），会被分词为关键词（tokens）加入索引。
 2. 文档的关键词（tokens）。当正文为空的时候，允许用户绕过悟空内置的分词器直接输入文档关键词，这使得在引擎外部进行文档分词成为可能。
@@ -133,7 +133,7 @@ type WeiboScoringFields struct {
 type WeiboScoringCriteria struct {
 }
 
-func (criteria WeiboScoringCriteria) Score(
+func (criteria WeiboScoringCriteria) Score {
         doc types.IndexedDocument, fields interface{}) []float32 {
         if reflect.TypeOf(fields) != reflect.TypeOf(WeiboScoringFields{}) {
                 return []float32{}
@@ -180,7 +180,7 @@ response := searcher.Search(types.SearchRequest{
 
 	go run search_server.go
 
-等待终端中出现“索引了xxx条微博”的输出后，在浏览器中打开[http://localhost:8080](http://localhost:8080) 即可进入搜索页面，这实现了 http://soooweibo.com
+等待终端中出现“索引了xxx条微博”的输出后，在浏览器中打开[http://localhost:8080](http://localhost:8080) 即可进入搜索页面。
 
 如果你想进一步了解悟空引擎，建议你直接阅读代码。代码的目录结构如下：
 

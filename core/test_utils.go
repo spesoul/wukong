@@ -6,15 +6,16 @@ import (
 )
 
 func indicesToString(indexer *Indexer, token string) (output string) {
-	indices := indexer.tableLock.table[token]
-	for i := 0; i < indexer.getIndexLength(indices); i++ {
-		output += fmt.Sprintf("%d ",
-			indexer.getDocId(indices, i))
+	if indices, ok := indexer.tableLock.table[token]; ok {
+		for i := 0; i < indexer.getIndexLength(indices); i++ {
+			output += fmt.Sprintf("%d ",
+				indexer.getDocId(indices, i))
+		}
 	}
 	return
 }
 
-func indexedDocsToString(docs []types.IndexedDocument) (output string) {
+func indexedDocsToString(docs []types.IndexedDocument, numDocs int) (output string) {
 	for _, doc := range docs {
 		output += fmt.Sprintf("[%d %d %v] ",
 			doc.DocId, doc.TokenProximity, doc.TokenSnippetLocations)

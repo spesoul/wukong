@@ -1,11 +1,13 @@
 package core
 
 import (
-	"github.com/huichen/wukong/types"
-	"github.com/huichen/wukong/utils"
 	"log"
 	"math"
+	"sort"
 	"sync"
+
+	"github.com/huichen/wukong/types"
+	"github.com/huichen/wukong/utils"
 )
 
 // 索引器
@@ -14,7 +16,18 @@ type Indexer struct {
 	// 加了读写锁以保证读写安全
 	tableLock struct {
 		sync.RWMutex
-		table map[string]*KeywordIndices
+		table     map[string]*KeywordIndices
+		docsState map[uint64]int // nil: 表示无状态记录，0: 存在于索引中，1: 等待删除，2: 等待加入
+	}
+	addCacheLock struct {
+		sync.RWMutex
+		addCachePointer int
+		addCache        types.DocumentsIndex
+	}
+	removeCacheLock struct {
+		sync.RWMutex
+		removeCachePointer int
+		removeCache        types.DocumentsId
 	}
 
 	initOptions types.IndexerInitOptions
@@ -43,15 +56,193 @@ func (indexer *Indexer) Init(options types.IndexerInitOptions) {
 	if indexer.initialized == true {
 		log.Fatal("索引器不能初始化两次")
 	}
+	options.Init()
+	indexer.initOptions = options
 	indexer.initialized = true
 
 	indexer.tableLock.table = make(map[string]*KeywordIndices)
-	indexer.initOptions = options
+	indexer.tableLock.docsState = make(map[uint64]int)
+	indexer.addCacheLock.addCache = make([]*types.DocumentIndex, indexer.initOptions.DocCacheSize)
+	indexer.removeCacheLock.removeCache = make([]uint64, indexer.initOptions.DocCacheSize*2)
 	indexer.docTokenLengths = make(map[uint64]float32)
 }
 
-// 向反向索引表中加入一个文档
-func (indexer *Indexer) AddDocument(document *types.DocumentIndex) {
+// 从KeywordIndices中得到第i个文档的DocId
+func (indexer *Indexer) getDocId(ti *KeywordIndices, i int) uint64 {
+	return ti.docIds[i]
+}
+
+// 得到KeywordIndices中文档总数
+func (indexer *Indexer) getIndexLength(ti *KeywordIndices) int {
+	return len(ti.docIds)
+}
+
+// 向 ADDCACHE 中加入一个文档
+func (indexer *Indexer) AddDocumentToCache(document *types.DocumentIndex, forceUpdate bool) {
+	if indexer.initialized == false {
+		log.Fatal("索引器尚未初始化")
+	}
+
+	indexer.addCacheLock.Lock()
+	if document != nil {
+		indexer.addCacheLock.addCache[indexer.addCacheLock.addCachePointer] = document
+		indexer.addCacheLock.addCachePointer++
+	}
+	if indexer.addCacheLock.addCachePointer >= indexer.initOptions.DocCacheSize || forceUpdate {
+		indexer.tableLock.Lock()
+		position := 0
+		for i := 0; i < indexer.addCacheLock.addCachePointer; i++ {
+			docIndex := indexer.addCacheLock.addCache[i]
+			if docState, ok := indexer.tableLock.docsState[docIndex.DocId]; ok && docState <= 1 {
+				// ok && docState == 0 表示存在于索引中，需先删除再添加
+				// ok && docState == 1 表示不一定存在于索引中，等待删除，需先删除再添加
+				if position != i {
+					indexer.addCacheLock.addCache[position], indexer.addCacheLock.addCache[i] =
+						indexer.addCacheLock.addCache[i], indexer.addCacheLock.addCache[position]
+				}
+				if docState == 0 {
+					indexer.removeCacheLock.Lock()
+					indexer.removeCacheLock.removeCache[indexer.removeCacheLock.removeCachePointer] =
+						docIndex.DocId
+					indexer.removeCacheLock.removeCachePointer++
+					indexer.removeCacheLock.Unlock()
+					indexer.tableLock.docsState[docIndex.DocId] = 1
+					indexer.numDocuments--
+				}
+				position++
+			} else if !ok {
+				indexer.tableLock.docsState[docIndex.DocId] = 2
+			}
+		}
+
+		indexer.tableLock.Unlock()
+		if indexer.RemoveDocumentToCache(0, forceUpdate) {
+			// 只有当存在于索引表中的文档已被删除，其才可以重新加入到索引表中
+			position = 0
+		}
+
+		addCachedDocuments := indexer.addCacheLock.addCache[position:indexer.addCacheLock.addCachePointer]
+		indexer.addCacheLock.addCachePointer = position
+		indexer.addCacheLock.Unlock()
+		sort.Sort(addCachedDocuments)
+		indexer.AddDocuments(&addCachedDocuments)
+	} else {
+		indexer.addCacheLock.Unlock()
+	}
+}
+
+// 向反向索引表中加入 ADDCACHE 中所有文档
+func (indexer *Indexer) AddDocuments(documents *types.DocumentsIndex) {
+	if indexer.initialized == false {
+		log.Fatal("索引器尚未初始化")
+	}
+
+	indexer.tableLock.Lock()
+	defer indexer.tableLock.Unlock()
+	indexPointers := make(map[string]int, len(indexer.tableLock.table))
+
+	// DocId 递增顺序遍历插入文档保证索引移动次数最少
+	for i, document := range *documents {
+		if i < len(*documents)-1 && (*documents)[i].DocId == (*documents)[i+1].DocId {
+			// 如果有重复文档加入，因为稳定排序，只加入最后一个
+			continue
+		}
+		if docState, ok := indexer.tableLock.docsState[document.DocId]; ok && docState == 1 {
+			// 如果此时 docState 仍为 1，说明该文档需被删除
+			// docState 合法状态为 nil & 2，保证一定不会插入已经在索引表中的文档
+			continue
+		}
+
+		// 更新文档关键词总长度
+		if document.TokenLength != 0 {
+			indexer.docTokenLengths[document.DocId] = float32(document.TokenLength)
+			indexer.totalTokenLength += document.TokenLength
+		}
+
+		docIdIsNew := true
+		for _, keyword := range document.Keywords {
+			indices, foundKeyword := indexer.tableLock.table[keyword.Text]
+			if !foundKeyword {
+				// 如果没找到该搜索键则加入
+				ti := KeywordIndices{}
+				switch indexer.initOptions.IndexType {
+				case types.LocationsIndex:
+					ti.locations = [][]int{keyword.Starts}
+				case types.FrequenciesIndex:
+					ti.frequencies = []float32{keyword.Frequency}
+				}
+				ti.docIds = []uint64{document.DocId}
+				indexer.tableLock.table[keyword.Text] = &ti
+				continue
+			}
+
+			// 查找应该插入的位置，且索引一定不存在
+			position, _ := indexer.searchIndex(
+				indices, indexPointers[keyword.Text], indexer.getIndexLength(indices)-1, document.DocId)
+			indexPointers[keyword.Text] = position
+			switch indexer.initOptions.IndexType {
+			case types.LocationsIndex:
+				indices.locations = append(indices.locations, []int{})
+				copy(indices.locations[position+1:], indices.locations[position:])
+				indices.locations[position] = keyword.Starts
+			case types.FrequenciesIndex:
+				indices.frequencies = append(indices.frequencies, float32(0))
+				copy(indices.frequencies[position+1:], indices.frequencies[position:])
+				indices.frequencies[position] = keyword.Frequency
+			}
+			indices.docIds = append(indices.docIds, 0)
+			copy(indices.docIds[position+1:], indices.docIds[position:])
+			indices.docIds[position] = document.DocId
+		}
+
+		// 更新文章状态和总数
+		if docIdIsNew {
+			indexer.tableLock.docsState[document.DocId] = 0
+			indexer.numDocuments++
+		}
+	}
+}
+
+// 向 REMOVECACHE 中加入一个待删除文档
+// 返回值表示文档是否在索引表中被删除
+func (indexer *Indexer) RemoveDocumentToCache(docId uint64, forceUpdate bool) bool {
+	if indexer.initialized == false {
+		log.Fatal("索引器尚未初始化")
+	}
+
+	indexer.removeCacheLock.Lock()
+	if docId != 0 {
+		indexer.tableLock.Lock()
+		if docState, ok := indexer.tableLock.docsState[docId]; ok && docState == 0 {
+			indexer.removeCacheLock.removeCache[indexer.removeCacheLock.removeCachePointer] = docId
+			indexer.removeCacheLock.removeCachePointer++
+			indexer.tableLock.docsState[docId] = 1
+			indexer.numDocuments--
+		} else if ok && docState == 2 {
+			// 删除一个等待加入的文档
+			indexer.tableLock.docsState[docId] = 1
+		} else if !ok {
+			// 若文档不存在，则无法判断其是否在 addCache 中，需避免这样的操作
+		}
+		indexer.tableLock.Unlock()
+	}
+
+	if indexer.removeCacheLock.removeCachePointer > 0 &&
+		(indexer.removeCacheLock.removeCachePointer >= indexer.initOptions.DocCacheSize ||
+			forceUpdate) {
+		removeCachedDocuments := indexer.removeCacheLock.removeCache[:indexer.removeCacheLock.removeCachePointer]
+		indexer.removeCacheLock.removeCachePointer = 0
+		indexer.removeCacheLock.Unlock()
+		sort.Sort(removeCachedDocuments)
+		indexer.RemoveDocuments(&removeCachedDocuments)
+		return true
+	}
+	indexer.removeCacheLock.Unlock()
+	return false
+}
+
+// 向反向索引表中删除 REMOVECACHE 中所有文档
+func (indexer *Indexer) RemoveDocuments(documents *types.DocumentsId) {
 	if indexer.initialized == false {
 		log.Fatal("索引器尚未初始化")
 	}
@@ -59,76 +250,60 @@ func (indexer *Indexer) AddDocument(document *types.DocumentIndex) {
 	indexer.tableLock.Lock()
 	defer indexer.tableLock.Unlock()
 
-	// 更新文档关键词总长度
-	if document.TokenLength != 0 {
-		originalLength, found := indexer.docTokenLengths[document.DocId]
-		indexer.docTokenLengths[document.DocId] = float32(document.TokenLength)
-		if found {
-			indexer.totalTokenLength += document.TokenLength - originalLength
-		} else {
-			indexer.totalTokenLength += document.TokenLength
-		}
+	// 更新文档关键词总长度，删除文档状态
+	for _, docId := range *documents {
+		indexer.totalTokenLength -= indexer.docTokenLengths[docId]
+		delete(indexer.docTokenLengths, docId)
+		delete(indexer.tableLock.docsState, docId)
 	}
 
-	docIdIsNew := true
-	for _, keyword := range document.Keywords {
-		indices, foundKeyword := indexer.tableLock.table[keyword.Text]
-		if !foundKeyword {
-			// 如果没找到该搜索键则加入
-			ti := KeywordIndices{}
+	for keyword, indices := range indexer.tableLock.table {
+		indicesTop, indicesPointer := 0, 0
+		documentsPointer := sort.Search(
+			len(*documents), func(i int) bool { return (*documents)[i] >= indices.docIds[0] })
+		// 双指针扫描，进行批量删除操作
+		for documentsPointer < len(*documents) && indicesPointer < indexer.getIndexLength(indices) {
+			if indices.docIds[indicesPointer] < (*documents)[documentsPointer] {
+				if indicesTop != indicesPointer {
+					switch indexer.initOptions.IndexType {
+					case types.LocationsIndex:
+						indices.locations[indicesTop] = indices.locations[indicesPointer]
+					case types.FrequenciesIndex:
+						indices.frequencies[indicesTop] = indices.frequencies[indicesPointer]
+					}
+					indices.docIds[indicesTop] = indices.docIds[indicesPointer]
+				}
+				indicesTop++
+				indicesPointer++
+			} else if indices.docIds[indicesPointer] == (*documents)[documentsPointer] {
+				indicesPointer++
+				documentsPointer++
+			} else {
+				documentsPointer++
+			}
+		}
+		if indicesTop != indicesPointer {
 			switch indexer.initOptions.IndexType {
 			case types.LocationsIndex:
-				ti.locations = [][]int{keyword.Starts}
+				indices.locations = append(
+					indices.locations[:indicesTop], indices.locations[indicesPointer:]...)
 			case types.FrequenciesIndex:
-				ti.frequencies = []float32{keyword.Frequency}
+				indices.frequencies = append(
+					indices.frequencies[:indicesTop], indices.frequencies[indicesPointer:]...)
 			}
-			ti.docIds = []uint64{document.DocId}
-			indexer.tableLock.table[keyword.Text] = &ti
-			continue
+			indices.docIds = append(
+				indices.docIds[:indicesTop], indices.docIds[indicesPointer:]...)
 		}
-
-		// 查找应该插入的位置
-		position, found := indexer.searchIndex(
-			indices, 0, indexer.getIndexLength(indices)-1, document.DocId)
-		if found {
-			docIdIsNew = false
-
-			// 覆盖已有的索引项
-			switch indexer.initOptions.IndexType {
-			case types.LocationsIndex:
-				indices.locations[position] = keyword.Starts
-			case types.FrequenciesIndex:
-				indices.frequencies[position] = keyword.Frequency
-			}
-			continue
+		if len(indices.docIds) == 0 {
+			delete(indexer.tableLock.table, keyword)
 		}
-
-		// 当索引不存在时，插入新索引项
-		switch indexer.initOptions.IndexType {
-		case types.LocationsIndex:
-			indices.locations = append(indices.locations, []int{})
-			copy(indices.locations[position+1:], indices.locations[position:])
-			indices.locations[position] = keyword.Starts
-		case types.FrequenciesIndex:
-			indices.frequencies = append(indices.frequencies, float32(0))
-			copy(indices.frequencies[position+1:], indices.frequencies[position:])
-			indices.frequencies[position] = keyword.Frequency
-		}
-		indices.docIds = append(indices.docIds, 0)
-		copy(indices.docIds[position+1:], indices.docIds[position:])
-		indices.docIds[position] = document.DocId
-	}
-
-	// 更新文章总数
-	if docIdIsNew {
-		indexer.numDocuments++
 	}
 }
 
 // 查找包含全部搜索键(AND操作)的文档
 // 当docIds不为nil时仅从docIds指定的文档中查找
 func (indexer *Indexer) Lookup(
-	tokens []string, labels []string, docIds *map[uint64]bool) (docs []types.IndexedDocument) {
+	tokens []string, labels []string, docIds map[uint64]bool, countDocsOnly bool) (docs []types.IndexedDocument, numDocs int) {
 	if indexer.initialized == false {
 		log.Fatal("索引器尚未初始化")
 	}
@@ -136,6 +311,7 @@ func (indexer *Indexer) Lookup(
 	if indexer.numDocuments == 0 {
 		return
 	}
+	numDocs = 0
 
 	// 合并关键词和标签为搜索键
 	keywords := make([]string, len(tokens)+len(labels))
@@ -172,10 +348,8 @@ func (indexer *Indexer) Lookup(
 	for ; indexPointers[0] >= 0; indexPointers[0]-- {
 		// 以第一个搜索键出现的文档作为基准，并遍历其他搜索键搜索同一文档
 		baseDocId := indexer.getDocId(table[0], indexPointers[0])
-
 		if docIds != nil {
-			_, found := (*docIds)[baseDocId]
-			if !found {
+			if _, found := docIds[baseDocId]; !found {
 				continue
 			}
 		}
@@ -205,6 +379,9 @@ func (indexer *Indexer) Lookup(
 		}
 
 		if found {
+			if docState, ok := indexer.tableLock.docsState[baseDocId]; !ok || docState != 0 {
+				continue
+			}
 			indexedDoc := types.IndexedDocument{}
 
 			// 当为LocationsIndex时计算关键词紧邻距离
@@ -217,10 +394,14 @@ func (indexer *Indexer) Lookup(
 					}
 				}
 				if numTokensWithLocations != len(tokens) {
-					docs = append(docs, types.IndexedDocument{
-						DocId: baseDocId,
-					})
-					break
+					if !countDocsOnly {
+						docs = append(docs, types.IndexedDocument{
+							DocId: baseDocId,
+						})
+					}
+					numDocs++
+					//当某个关键字对应多个文档且有lable关键字存在时，若直接break,将会丢失相当一部分搜索结果
+					continue
 				}
 
 				// 计算搜索键在文档中的紧邻距离
@@ -261,7 +442,10 @@ func (indexer *Indexer) Lookup(
 			}
 
 			indexedDoc.DocId = baseDocId
-			docs = append(docs, indexedDoc)
+			if !countDocsOnly {
+				docs = append(docs, indexedDoc)
+			}
+			numDocs++
 		}
 	}
 	return
@@ -387,14 +571,4 @@ func computeTokenProximity(table []*KeywordIndices, indexPointers []int, tokens 
 		tokenLocations[i] = table[i].locations[indexPointers[i]][cursor]
 	}
 	return
-}
-
-// 从KeywordIndices中得到第i个文档的DocId
-func (indexer *Indexer) getDocId(ti *KeywordIndices, i int) uint64 {
-	return ti.docIds[i]
-}
-
-// 得到KeywordIndices中文档总数
-func (indexer *Indexer) getIndexLength(ti *KeywordIndices) int {
-	return len(ti.docIds)
 }
